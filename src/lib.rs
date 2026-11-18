@@ -52,6 +52,52 @@ pub struct LineMetrics {
     pub bounds: LocalRect,
 }
 
+/// Validation helpers. Abnormal inputs (NaN, infinity, negative
+/// sizes) fail explicitly with a panic instead of silently
+/// propagating NaN coverage or huge bounds to the GPU.
+fn check_finite_point(p: LocalPoint, what: &str) {
+    assert!(
+        p.x.is_finite() && p.y.is_finite(),
+        "vger: {} must be finite, got ({}, {})",
+        what,
+        p.x,
+        p.y
+    );
+}
+
+fn check_finite_scalar(v: f32, what: &str) {
+    assert!(v.is_finite(), "vger: {} must be finite, got {}", what, v);
+}
+
+fn check_non_negative(v: f32, what: &str) {
+    assert!(
+        v.is_finite() && v >= 0.0,
+        "vger: {} must be finite and non-negative, got {}",
+        what,
+        v
+    );
+}
+
+fn check_positive(v: f32, what: &str) {
+    assert!(
+        v.is_finite() && v > 0.0,
+        "vger: {} must be finite and positive, got {}",
+        what,
+        v
+    );
+}
+
+fn check_finite_rect(r: LocalRect, what: &str) {
+    check_finite_point(r.origin, what);
+    assert!(
+        r.size.width.is_finite() && r.size.height.is_finite(),
+        "vger: {} size must be finite, got ({}, {})",
+        what,
+        r.size.width,
+        r.size.height
+    );
+}
+
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
 pub(crate) struct Scissor {
@@ -412,6 +458,8 @@ impl Vger {
         let mut prim = Prim::default();
         prim.prim_type = PrimType::Circle as u32;
         let c: LocalPoint = center.into();
+        check_finite_point(c, "fill_circle center");
+        check_non_negative(radius, "fill_circle radius");
         prim.cvs[0] = c.x;
         prim.cvs[1] = c.y;
         prim.radius = radius;
@@ -438,6 +486,11 @@ impl Vger {
         prim.prim_type = PrimType::Arc as u32;
         prim.radius = radius;
         let c: LocalPoint = center.into();
+        check_finite_point(c, "stroke_arc center");
+        check_non_negative(radius, "stroke_arc radius");
+        check_non_negative(width, "stroke_arc width");
+        check_finite_scalar(rotation, "stroke_arc rotation");
+        check_finite_scalar(aperture, "stroke_arc aperture");
         prim.cvs = [
             c.x,
             c.y,
@@ -471,6 +524,8 @@ impl Vger {
         let mut prim = Prim::default();
         prim.prim_type = PrimType::Rect as u32;
         let r: LocalRect = rect.into();
+        check_finite_rect(r, "fill_rect rect");
+        check_non_negative(radius, "fill_rect radius");
         let min = r.min();
         let max = r.max();
         prim.cvs[0] = min.x;
@@ -498,6 +553,10 @@ impl Vger {
         let mut prim = Prim::default();
         prim.prim_type = PrimType::BlurredRect as u32;
         let r: LocalRect = rect.into();
+        check_finite_rect(r, "fill_blurred_rect rect");
+        check_non_negative(radius, "fill_blurred_rect radius");
+        // A zero blur radius divides by zero in the shader.
+        check_positive(blur_radius, "fill_blurred_rect blur_radius");
         let min = r.min();
         let max = r.max();
         prim.cvs[0] = min.x;
@@ -529,6 +588,10 @@ impl Vger {
         width: f32,
         paint_index: PaintIndex,
     ) {
+        check_finite_point(min, "stroke_rect min");
+        check_finite_point(max, "stroke_rect max");
+        check_non_negative(radius, "stroke_rect radius");
+        check_non_negative(width, "stroke_rect width");
         let mut prim = Prim::default();
         prim.prim_type = PrimType::RectStroke as u32;
         prim.cvs[0] = min.x;
@@ -558,6 +621,9 @@ impl Vger {
         prim.prim_type = PrimType::Segment as u32;
         let ap: LocalPoint = a.into();
         let bp: LocalPoint = b.into();
+        check_finite_point(ap, "stroke_segment a");
+        check_finite_point(bp, "stroke_segment b");
+        check_non_negative(width, "stroke_segment width");
         prim.cvs[0] = ap.x;
         prim.cvs[1] = ap.y;
         prim.cvs[2] = bp.x;
@@ -591,6 +657,10 @@ impl Vger {
         let ap: LocalPoint = a.into();
         let bp: LocalPoint = b.into();
         let cp: LocalPoint = c.into();
+        check_finite_point(ap, "stroke_bezier a");
+        check_finite_point(bp, "stroke_bezier b");
+        check_finite_point(cp, "stroke_bezier c");
+        check_non_negative(width, "stroke_bezier width");
         prim.cvs[0] = ap.x;
         prim.cvs[1] = ap.y;
         prim.cvs[2] = bp.x;
@@ -614,15 +684,23 @@ impl Vger {
 
     /// Move the pen to a point (path fills only)
     pub fn move_to<Pt: Into<LocalPoint>>(&mut self, p: Pt) {
-        self.pen = p.into();
+        let p: LocalPoint = p.into();
+        check_finite_point(p, "move_to point");
+        // Moving the pen after emitting segments starts a new subpath,
+        // which is closed independently of the previous one.
+        self.path_scanner.start_subpath();
+        self.pen = p;
     }
 
     /// Makes a quadratic curve to a point (path fills only)
     pub fn quad_to<Pt: Into<LocalPoint>>(&mut self, b: Pt, c: Pt) {
+        let bp: LocalPoint = b.into();
         let cp: LocalPoint = c.into();
+        check_finite_point(bp, "quad_to control point");
+        check_finite_point(cp, "quad_to end point");
         self.path_scanner
             .segments
-            .push(PathSegment::new(self.pen, b.into(), cp));
+            .push(PathSegment::new(self.pen, bp, cp));
         self.pen = cp;
     }
 
@@ -646,8 +724,8 @@ impl Vger {
             prim.start = self.scenes[self.cur_scene].cvs.len() as u32;
 
             let mut x_interval = Interval {
-                a: std::f32::MAX,
-                b: std::f32::MIN,
+                a: f32::MAX,
+                b: f32::MIN,
             };
 
             let mut index = self.path_scanner.first;
@@ -663,6 +741,13 @@ impl Vger {
                 index = self.path_scanner.segments[a].next;
             }
 
+            // Skip bands with no active segments (e.g. the gap between
+            // disjoint subpaths). Emitting a prim here would produce an
+            // inverted, sentinel-valued (±f32::MAX) bounding box.
+            if prim.count == 0 {
+                continue;
+            }
+
             prim.quad_bounds[0] = x_interval.a;
             prim.quad_bounds[1] = self.path_scanner.interval.a;
             prim.quad_bounds[2] = x_interval.b;
@@ -672,7 +757,19 @@ impl Vger {
             self.render(prim);
         }
 
-        self.path_scanner.segments.clear()
+        self.path_scanner.reset()
+    }
+
+    /// Number of prims emitted for the current layer. Intended for tests.
+    #[doc(hidden)]
+    pub fn debug_prim_count(&self) -> usize {
+        self.scenes[self.cur_scene].prims[self.cur_layer].len()
+    }
+
+    /// Quad bounds of the i-th prim on the current layer. Intended for tests.
+    #[doc(hidden)]
+    pub fn debug_prim_quad_bounds(&self, index: usize) -> [f32; 4] {
+        self.scenes[self.cur_scene].prims[self.cur_layer][index].quad_bounds
     }
 
     fn setup_layout(&mut self, text: &str, size: u32, max_width: Option<f32>) {
@@ -880,6 +977,7 @@ impl Vger {
 
     /// Sets the current scissor rect.
     pub fn scissor(&mut self, rect: LocalRect) {
+        check_finite_rect(rect, "scissor rect");
         if let Some(m) = self.scissor_stack.last_mut() {
             *m = Scissor::new();
             if let Some(xform) = self.tx_stack.last().unwrap().inverse() {
@@ -893,6 +991,8 @@ impl Vger {
 
     /// Sets the current scissor to a rounded rect.
     pub fn rounded_scissor(&mut self, rect: LocalRect, radius: f32) {
+        check_finite_rect(rect, "rounded_scissor rect");
+        check_non_negative(radius, "rounded_scissor radius");
         if let Some(m) = self.scissor_stack.last_mut() {
             *m = Scissor::new();
             if let Some(xform) = self.tx_stack.last().unwrap().inverse() {
@@ -936,9 +1036,14 @@ impl Vger {
         outer_color: Color,
         glow: f32,
     ) -> PaintIndex {
+        let start: LocalPoint = start.into();
+        let end: LocalPoint = end.into();
+        check_finite_point(start, "linear_gradient start");
+        check_finite_point(end, "linear_gradient end");
+        check_finite_scalar(glow, "linear_gradient glow");
         self.add_paint(Paint::linear_gradient(
-            start.into(),
-            end.into(),
+            start,
+            end,
             inner_color,
             outer_color,
             glow,

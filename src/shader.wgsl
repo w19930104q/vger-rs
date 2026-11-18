@@ -110,19 +110,29 @@ fn sdSegment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32
 {
     let pa = p-a;
     let ba = b-a;
-    let h = clamp( dot(pa,ba)/dot(ba,ba), 0.0, 1.0 );
+    let bb = dot(ba,ba);
+    // Degenerate (zero-length or non-finite) segment: distance to the endpoint.
+    if !(bb > 1e-12) {
+        return length(pa);
+    }
+    let h = clamp( dot(pa,ba)/bb, 0.0, 1.0 );
     return length( pa - ba*h );
 }
 
 fn sdSegment2(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>, width: f32) -> f32
 {
-    let u = normalize(b-a);
+    let ba = b-a;
+    // Degenerate (zero-length or non-finite) segment: round cap.
+    if !(dot(ba,ba) > 1e-12) {
+        return sdCircle(p - a, width/2.0);
+    }
+    let u = normalize(ba);
     let v = rot90(u);
 
     var pp = p;
     pp = pp - (a+b)/2.0;
     pp = pp * mat2x2<f32>(u, v);
-    return sdBox(pp, vec2<f32>(length(b-a)/2.0, width/2.0), 0.0);
+    return sdBox(pp, vec2<f32>(length(ba)/2.0, width/2.0), 0.0);
 }
 
 // sca is {sin,cos} of orientation
@@ -148,9 +158,16 @@ fn sdBezier(pos: vec2<f32>, A: vec2<f32>, B: vec2<f32>, C: vec2<f32> ) -> f32
 {
     let a = B - A;
     let b = A - 2.0*B + C;
+    let bb = dot(b,b);
+    // Degenerate quadratic (collinear or repeated control points, e.g. at
+    // sharp joins and closing segments, or non-finite coordinates):
+    // the curve coincides with the chord A-C.
+    if !(bb > 1e-12 && bb < 1e30) {
+        return sdSegment(pos, A, C);
+    }
     let c = a * 2.0;
     let d = A - pos;
-    let kk = 1.0/dot(b,b);
+    let kk = 1.0/bb;
     let kx = kk * dot(a,b);
     let ky = kk * (2.0*dot(a,a)+dot(d,b)) / 3.0;
     let kz = kk * dot(d,a);
@@ -245,7 +262,13 @@ fn get_distance_vector(b0: vec2<f32>, b1: vec2<f32>, b2: vec2<f32>) -> vec2<f32>
     let d21=b2-b1; let d10=b1-b0; let d20=b2-b0;
     var gf=2.0*(b*d21+d*d10+a*d20);
     gf=vec2<f32>(gf.y,-gf.x);
-    let pp=-f*gf/dot(gf,gf);
+    let gg = dot(gf,gf);
+    // Degenerate gradient (e.g. a straight line): no well-defined
+    // closest point; fall back to the distance to an endpoint.
+    if !(gg > 1e-20) {
+        return b0;
+    }
+    let pp=-f*gf/gg;
     let d0p=b0-pp;
     let ap=det(d0p,d20); let bp=2.0*det(d10,d0p);
     // (note that 2*ap+bp+dp=2*a+b+d=4*area(b0,b1,b2))
@@ -258,7 +281,8 @@ fn sdBezierApprox(p: vec2<f32>, A: vec2<f32>, B: vec2<f32>, C: vec2<f32>) -> f32
 
     let v0 = normalize(B - A); let v1 = normalize(C - A);
     let det = v0.x * v1.y - v1.x * v0.y;
-    if(abs(det) < 0.01) {
+    // Also catches NaN det from degenerate (repeated) control points.
+    if !(abs(det) >= 0.01) {
         return sdBezier(p, A, B, C);
     }
 
@@ -377,6 +401,15 @@ fn bezierTest(p: vec2<f32>, A: vec2<f32>, B: vec2<f32>, C: vec2<f32>) -> bool {
     // p = s * A + t * B + (1-s-t) * C
     let v0 = B - A; let v1 = C - A; let v2 = p - A;
     let det = v0.x * v1.y - v1.x * v0.y;
+
+    // Degenerate hull (collinear or non-finite, e.g. at sharp joins and
+    // closing segments): the curve coincides with the chord, which
+    // lineTest already accounts for.
+    let hull_scale = length(v0) * length(v1);
+    if !(abs(det) > 1e-6 * hull_scale) {
+        return false;
+    }
+
     let s = (v2.x * v1.y - v1.x * v2.y) / det;
     let t = (v0.x * v2.y - v2.x * v0.y) / det;
 
@@ -616,9 +649,15 @@ struct Scissors {
 var<storage> scissors: Scissors;
 
 // Given an sdf (d) and AA filter width, calculate
-// and alpha.
+// and alpha. Coverage is always in [0, 1]; NaN distances
+// (degenerate geometry) yield zero coverage instead of
+// poisoning the blend stage.
 fn sdf_alpha(d: f32, fw: f32) -> f32 {
-    return 1.0-smoothstep(-fw/2.0,fw/2.0,d);
+    if !(d == d) {
+        return 0.0;
+    }
+    let w = max(fw, 1e-6);
+    return clamp(1.0-smoothstep(-w/2.0,w/2.0,d), 0.0, 1.0);
 }
 
 // Returns the signed distance function for a scissor rectangle.

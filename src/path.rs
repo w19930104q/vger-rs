@@ -41,6 +41,10 @@ struct PathScannerNode {
 
 pub struct PathScanner {
     pub segments: Vec<PathSegment>,
+    /// Indices in `segments` where new subpaths begin (each `move_to`
+    /// after the first). Every subpath is closed independently so
+    /// disjoint subpaths never get connected by a synthetic segment.
+    subpath_starts: Vec<usize>,
     nodes: Vec<PathScannerNode>,
     index: usize,
     pub interval: Interval,
@@ -51,6 +55,7 @@ impl PathScanner {
     pub fn new() -> Self {
         Self {
             segments: vec![],
+            subpath_starts: vec![],
             nodes: vec![],
             index: 0,
             interval: Interval { a: 0.0, b: 0.0 },
@@ -58,19 +63,45 @@ impl PathScanner {
         }
     }
 
+    /// Marks the start of a new subpath at the current segment count.
+    /// Called when the pen is moved after segments have been emitted.
+    pub fn start_subpath(&mut self) {
+        let n = self.segments.len();
+        let last = self.subpath_starts.last().copied().unwrap_or(0);
+        if n > last {
+            self.subpath_starts.push(n);
+        }
+    }
+
+    /// Clears all segments and subpath breaks.
+    pub fn reset(&mut self) {
+        self.segments.clear();
+        self.subpath_starts.clear();
+    }
+
     pub fn init(&mut self) {
-        // Close the path if necessary.
-        if let Some(first) = self.segments.first() {
-            if let Some(last) = self.segments.last() {
-                let start = first.cvs[0];
-                let end = last.cvs[2];
-                if start != end {
-                    self.segments.push(PathSegment {
-                        cvs: [end, start.lerp(end, 0.5), start],
-                        next: None,
-                        previous: None,
-                    })
-                }
+        // Close each subpath independently.
+        let mut ranges: Vec<(usize, usize)> = vec![];
+        let mut prev = 0;
+        for &b in &self.subpath_starts {
+            if b > prev && b <= self.segments.len() {
+                ranges.push((prev, b));
+                prev = b;
+            }
+        }
+        if self.segments.len() > prev {
+            ranges.push((prev, self.segments.len()));
+        }
+
+        for (a, b) in ranges {
+            let start = self.segments[a].cvs[0];
+            let end = self.segments[b - 1].cvs[2];
+            if start != end {
+                self.segments.push(PathSegment {
+                    cvs: [end, start.lerp(end, 0.5), start],
+                    next: None,
+                    previous: None,
+                })
             }
         }
 
@@ -95,10 +126,10 @@ impl PathScanner {
     }
 
     pub fn begin(&mut self, cvs: &[LocalPoint]) {
-        self.segments.clear();
+        self.reset();
 
         let mut i = 0;
-        while i < cvs.len() - 2 {
+        while i + 2 < cvs.len() {
             self.segments.push(PathSegment {
                 cvs: [cvs[i], cvs[i + 1], cvs[i + 2]],
                 next: None,
@@ -111,6 +142,12 @@ impl PathScanner {
     }
 
     pub fn next(&mut self) -> bool {
+        // Empty (or exhausted) scan: nothing to do. This can happen
+        // when fill() is called with no path segments.
+        if self.index >= self.nodes.len() {
+            return false;
+        }
+
         let y = self.nodes[self.index].coord;
         self.interval.a = y;
         let n = self.nodes.len();
@@ -189,5 +226,76 @@ mod tests {
 
             println!();
         }
+    }
+
+    #[test]
+    fn test_empty_scanner() {
+        // fill() with no segments must not panic or produce bands.
+        let mut scan = PathScanner::new();
+        scan.init();
+        assert!(!scan.next());
+
+        let mut scan = PathScanner::new();
+        scan.begin(&[]);
+        assert!(!scan.next());
+    }
+
+    #[test]
+    fn test_subpaths_closed_independently() {
+        // Two disjoint squares, far apart in y. Each subpath must be
+        // closed independently; no synthetic segment may connect them.
+        let mut scan = PathScanner::new();
+
+        // Square 1: (0, 0) - (10, 10).
+        scan.segments.push(PathSegment::new(
+            [0.0, 0.0].into(),
+            [5.0, 0.0].into(),
+            [10.0, 0.0].into(),
+        ));
+        scan.segments.push(PathSegment::new(
+            [10.0, 0.0].into(),
+            [10.0, 10.0].into(),
+            [0.0, 10.0].into(),
+        ));
+
+        scan.start_subpath();
+
+        // Square 2: (0, 100) - (10, 110).
+        scan.segments.push(PathSegment::new(
+            [0.0, 100.0].into(),
+            [5.0, 100.0].into(),
+            [10.0, 100.0].into(),
+        ));
+        scan.segments.push(PathSegment::new(
+            [10.0, 100.0].into(),
+            [10.0, 110.0].into(),
+            [0.0, 110.0].into(),
+        ));
+
+        scan.init();
+
+        // Two closing segments, one per subpath.
+        assert_eq!(scan.segments.len(), 6);
+        let close1 = &scan.segments[4].cvs;
+        assert_eq!(close1[0], LocalPoint::new(0.0, 10.0));
+        assert_eq!(close1[2], LocalPoint::new(0.0, 0.0));
+        let close2 = &scan.segments[5].cvs;
+        assert_eq!(close2[0], LocalPoint::new(0.0, 110.0));
+        assert_eq!(close2[2], LocalPoint::new(0.0, 100.0));
+
+        // The scan must yield an empty band in the gap between the
+        // two subpaths (no active segments), which fill() will skip.
+        let mut saw_empty_band = false;
+        let mut band_count = 0;
+        while scan.next() {
+            band_count += 1;
+            if scan.first.is_none() {
+                saw_empty_band = true;
+                // The empty band spans the gap between the squares.
+                assert!(scan.interval.a >= 9.0 && scan.interval.b <= 101.0);
+            }
+        }
+        assert!(saw_empty_band);
+        assert!(band_count >= 3);
     }
 }
